@@ -1,8 +1,3 @@
-# 名称|mode|format|url
-# mode: domain / ipcidr / mixed
-# format: txt / list / text / yaml / yml
-
-# 示例：
-# ads|domain|txt|https://example.com/ads.txt
-# private_ip|ipcidr|list|https://example.com/private.list
-# mixed_rules|mixed|yaml|https://example.com/mixed.yaml
+# https://example.com/domain.yaml|my-domain|domain
+# https://example.com/ipcidr.yaml|my-ip|ipcidr
+# https://example.com/mixed.list|mixed|auto
