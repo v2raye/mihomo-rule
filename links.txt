@@ -3,3 +3,5 @@ https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/Telegram.list
 https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/ai.list
 https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/YouTube.list
 https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/Apple.list
+https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/Microsoft.list
+https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/Samsung.list
