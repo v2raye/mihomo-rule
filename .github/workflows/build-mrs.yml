@@ -3,9 +3,10 @@ name: build-mrs
 on:
   workflow_dispatch:
 
-  # 北京时间每天 06:00 = UTC 每天 22:00
+  # 北京时间每天 06:00 自动运行
   schedule:
-    - cron: "0 22 * * *"
+    - cron: "0 6 * * *"
+      timezone: "Asia/Shanghai"
 
 permissions:
   contents: write
@@ -57,6 +58,7 @@ jobs:
           assets = data.get("assets", [])
 
           candidates = []
+
           for asset in assets:
               name = asset.get("name", "")
               url = asset.get("browser_download_url", "")
@@ -71,13 +73,12 @@ jobs:
           if not candidates:
               raise SystemExit("没有找到 mihomo linux-amd64 .gz 下载文件")
 
-          # 优先选择 compatible 版本，兼容性最好
+          # 优先 compatible，兼容性最好
           candidates.sort(key=lambda x: ("compatible" not in x[0], x[0]))
 
           name, url = candidates[0]
 
-          print(f"MIHOMO_ASSET_NAME={name}")
-          print(f"MIHOMO_ASSET_URL={url}")
+          print(f"使用 mihomo: {name}")
 
           with open("mihomo_asset_url.txt", "w", encoding="utf-8") as f:
               f.write(url)
@@ -91,16 +92,19 @@ jobs:
 
           ./bin/mihomo -v
 
-      - name: Build MRS rules
+      - name: Build MRS and TXT rules
         shell: bash
         env:
           MIHOMO_BIN: ./bin/mihomo
         run: |
           set -euo pipefail
 
-          python scripts/build_mrs.py
+          python scripts/build_rules.py
 
-      - name: Commit and push changes
+          # 不允许 manifest.json 进入 rule/mihomo
+          rm -f rule/mihomo/manifest.json
+
+      - name: Commit and push rule changes
         shell: bash
         run: |
           set -euo pipefail
@@ -108,12 +112,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add rule/mihomo
+          # 如果旧版本已经提交过 manifest.json，这里自动从 Git 跟踪中删除
+          git rm --ignore-unmatch rule/mihomo/manifest.json || true
+          rm -f rule/mihomo/manifest.json
+
+          # 只提交 .mrs 和 .txt
+          find rule/mihomo -maxdepth 1 \( -name "*.mrs" -o -name "*.txt" \) -print0 | xargs -0 -r git add
 
           if git diff --cached --quiet; then
-            echo "没有规则变化，不需要提交。"
+            echo "没有 .mrs 或 .txt 规则变化，不需要提交。"
             exit 0
           fi
 
-          git commit -m "chore: update mihomo mrs rules"
+          git commit -m "chore: update mihomo rules"
           git push
