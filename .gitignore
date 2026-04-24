@@ -1,0 +1,7 @@
+bin/
+mihomo.gz
+mihomo_asset_url.txt
+__pycache__/
+*.pyc
+
+rule/mihomo/manifest.json
