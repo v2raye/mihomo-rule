@@ -1,18 +1,18 @@
-name: Build mihomo MRS rules
+name: build-mrs
 
 on:
   workflow_dispatch:
+
+  # 北京时间每天 06:00 = UTC 每天 22:00
   schedule:
-    # 每天北京时间 06:00 自动运行
-    - cron: "0 6 * * *"
-      timezone: "Asia/Shanghai"
+    - cron: "0 22 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-mihomo-mrs
-  cancel-in-progress: false
+  group: build-mrs
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,65 +20,88 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests pyyaml
-
-      - name: Download latest mihomo
+      - name: Install Python requirements
+        shell: bash
         run: |
           set -euo pipefail
+
+          python -m pip install --upgrade pip
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Download mihomo
+        shell: bash
+        run: |
+          set -euo pipefail
+
           mkdir -p bin
 
-          python - <<'PY' > /tmp/mihomo_download_url
+          python - <<'PY'
           import json
-          import re
-          import sys
           import urllib.request
 
           api = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+
           with urllib.request.urlopen(api) as r:
               data = json.load(r)
 
           assets = data.get("assets", [])
-          patterns = [
-              r"^mihomo-linux-amd64-compatible-v[\w.\-]+\.gz$",
-              r"^mihomo-linux-amd64-v[\w.\-]+\.gz$",
-              r"^mihomo-linux-amd64-.*\.gz$",
-          ]
 
-          for pat in patterns:
-              for asset in assets:
-                  if re.match(pat, asset.get("name", "")):
-                      print(asset["browser_download_url"])
-                      raise SystemExit(0)
+          candidates = []
+          for asset in assets:
+              name = asset.get("name", "")
+              url = asset.get("browser_download_url", "")
 
-          print("No suitable linux-amd64 mihomo asset found", file=sys.stderr)
-          print([a.get("name") for a in assets], file=sys.stderr)
-          raise SystemExit(1)
+              if (
+                  "linux-amd64" in name
+                  and name.endswith(".gz")
+                  and "alpha" not in name.lower()
+              ):
+                  candidates.append((name, url))
+
+          if not candidates:
+              raise SystemExit("没有找到 mihomo linux-amd64 .gz 下载文件")
+
+          # 优先选择 compatible 版本，兼容性最好
+          candidates.sort(key=lambda x: ("compatible" not in x[0], x[0]))
+
+          name, url = candidates[0]
+
+          print(f"MIHOMO_ASSET_NAME={name}")
+          print(f"MIHOMO_ASSET_URL={url}")
+
+          with open("mihomo_asset_url.txt", "w", encoding="utf-8") as f:
+              f.write(url)
           PY
 
-          url="$(cat /tmp/mihomo_download_url)"
-          echo "Downloading: $url"
-          curl -fsSL "$url" -o /tmp/mihomo.gz
-          gzip -dc /tmp/mihomo.gz > bin/mihomo
+          MIHOMO_URL="$(cat mihomo_asset_url.txt)"
+
+          curl -fsSL "$MIHOMO_URL" -o mihomo.gz
+          gzip -dc mihomo.gz > bin/mihomo
           chmod +x bin/mihomo
+
           ./bin/mihomo -v
 
-      - name: Convert rule sets to MRS
+      - name: Build MRS rules
+        shell: bash
         env:
           MIHOMO_BIN: ./bin/mihomo
         run: |
+          set -euo pipefail
+
           python scripts/build_mrs.py
 
-      - name: Commit generated MRS files
+      - name: Commit and push changes
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -88,8 +111,9 @@ jobs:
           git add rule/mihomo
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "chore: update mihomo mrs rules"
-            git push
+            echo "没有规则变化，不需要提交。"
+            exit 0
           fi
+
+          git commit -m "chore: update mihomo mrs rules"
+          git push
