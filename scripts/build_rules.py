@@ -1,341 +1,432 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Download txt/yaml/list rule sets, normalize them, and convert them to mihomo .mrs.
+
+links.txt format:
+  URL
+  URL|output_name
+  URL|output_name|behavior
+
+behavior:
+  auto    -> split domain/ipcidr automatically when needed
+  domain  -> only build domain mrs
+  ipcidr  -> only build ipcidr mrs
+"""
+
 from __future__ import annotations
 
-import hashlib
 import ipaddress
-import shutil
+import json
+import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from urllib.parse import urlparse, unquote
 
 import requests
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent
+
+ROOT = Path(__file__).resolve().parents[1]
 LINKS_FILE = ROOT / "links.txt"
-OUTPUT_DIR = ROOT / "rule" / "mihomo"
-USER_AGENT = "mihomo-mrs-auto/2.0"
-TIMEOUT = 60
-SUPPORTED_FORMATS = {"txt", "list", "text", "yaml", "yml"}
-SUPPORTED_MODES = {"domain", "ipcidr", "mixed"}
+OUT_DIR = ROOT / "rule" / "mihomo"
+BUILD_DIR = ROOT / "build"
+MIHOMO_BIN = Path(os.environ.get("MIHOMO_BIN", ROOT / "bin" / "mihomo"))
+
+TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "45"))
+USER_AGENT = os.environ.get(
+    "DOWNLOAD_USER_AGENT",
+    "mihomo-mrs-auto-convert/1.0 (+https://github.com/)",
+)
+
+RULE_PREFIXES_DOMAIN = {
+    "DOMAIN",
+    "DOMAIN-SUFFIX",
+    "DOMAIN-KEYWORD",
+    "DOMAIN-REGEX",
+    "GEOSITE",
+    "PROCESS-NAME",
+    "PROCESS-PATH",
+}
+RULE_PREFIXES_IP = {
+    "IP-CIDR",
+    "IP-CIDR6",
+    "IP-ASN",
+    "GEOIP",
+    "SRC-IP-CIDR",
+    "SRC-IP-ASN",
+}
 
 
-@dataclass
-class RuleItem:
-    name: str
-    mode: str
-    fmt: str
+@dataclass(frozen=True)
+class SourceItem:
     url: str
-
-    @property
-    def input_fmt(self) -> str:
-        fmt = self.fmt.lower().strip()
-        if fmt in {"txt", "list", "text"}:
-            return "text"
-        if fmt in {"yaml", "yml"}:
-            return "yaml"
-        raise ValueError(f"不支持的 format: {self.fmt}")
+    name: str
+    behavior: str = "auto"
 
 
-@dataclass
-class SplitResult:
-    domains: List[str]
-    ipcidrs: List[str]
-    skipped: List[str]
+def die(msg: str, code: int = 1) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    raise SystemExit(code)
 
 
-def ensure_mihomo() -> str:
-    path = shutil.which("mihomo")
-    if not path:
-        raise RuntimeError("未找到 mihomo 命令，请先安装 Mihomo。")
-    return path
+def safe_name(value: str) -> str:
+    value = unquote(value).strip()
+    value = re.sub(r"[?#].*$", "", value)
+    value = value.rsplit("/", 1)[-1] or "ruleset"
+    value = re.sub(r"\.(ya?ml|txt|list|conf|rules?)$", "", value, flags=re.I)
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-_")
+    return value or "ruleset"
 
 
-def parse_links(path: Path) -> List[RuleItem]:
+def parse_links(path: Path) -> list[SourceItem]:
     if not path.exists():
-        raise FileNotFoundError(f"未找到配置文件: {path}")
+        die("links.txt 不存在，请先创建并写入规则链接。")
 
-    items: List[RuleItem] = []
-    for idx, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    items: list[SourceItem] = []
+    used: dict[str, int] = {}
+
+    for idx, raw in enumerate(path.read_text("utf-8").splitlines(), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
 
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) != 4:
-            raise ValueError(
-                f"links.txt 第 {idx} 行格式错误，应为：名称|mode|format|url\n实际内容：{raw}"
-            )
+        url = parts[0]
+        if not re.match(r"^https?://", url, flags=re.I):
+            print(f"[WARN] links.txt 第 {idx} 行不是 http/https 链接，已跳过：{line}")
+            continue
 
-        name, mode, fmt, url = parts
-        mode = mode.lower()
-        fmt = fmt.lower()
+        name = parts[1] if len(parts) >= 2 and parts[1] else safe_name(urlparse(url).path)
+        name = safe_name(name)
 
-        if not name:
-            raise ValueError(f"links.txt 第 {idx} 行名称为空")
-        if mode not in SUPPORTED_MODES:
-            raise ValueError(f"links.txt 第 {idx} 行 mode 只能是 domain / ipcidr / mixed")
-        if fmt not in SUPPORTED_FORMATS:
-            raise ValueError(f"links.txt 第 {idx} 行 format 仅支持 txt/list/text/yaml/yml")
-        if not (url.startswith("http://") or url.startswith("https://")):
-            raise ValueError(f"links.txt 第 {idx} 行 url 非法：{url}")
+        behavior = parts[2].lower() if len(parts) >= 3 and parts[2] else "auto"
+        if behavior not in {"auto", "domain", "ipcidr"}:
+            print(f"[WARN] links.txt 第 {idx} 行 behavior 无效，改为 auto：{behavior}")
+            behavior = "auto"
 
-        items.append(RuleItem(name=name, mode=mode, fmt=fmt, url=url))
+        base = name
+        used[base] = used.get(base, 0) + 1
+        if used[base] > 1:
+            name = f"{base}-{used[base]}"
+
+        items.append(SourceItem(url=url, name=name, behavior=behavior))
 
     if not items:
-        print("[INFO] links.txt 中没有可处理的规则。")
+        die("links.txt 没有有效链接。")
     return items
 
 
-def download_file(url: str, target: Path) -> None:
-    headers = {"User-Agent": USER_AGENT}
-    with requests.get(url, headers=headers, timeout=TIMEOUT, stream=True) as resp:
-        resp.raise_for_status()
-        with target.open("wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 64):
-                if chunk:
-                    f.write(chunk)
-
-
-def sha256sum(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def convert_rule(mihomo_bin: str, behavior: str, input_fmt: str, src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [mihomo_bin, "convert-ruleset", behavior, input_fmt, str(src), str(dst)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"转换失败\n命令: {' '.join(cmd)}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-        )
-
-
-def read_source_entries(path: Path, input_fmt: str) -> List[str]:
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    if input_fmt == "text":
-        return text.splitlines()
-
-    data = yaml.safe_load(text)
-    if data is None:
-        return []
-
-    if isinstance(data, dict) and isinstance(data.get("payload"), list):
-        return [str(x) for x in data["payload"]]
-    if isinstance(data, list):
-        return [str(x) for x in data]
-
-    raise ValueError("YAML 内容无法识别，需为 payload 列表或顶层列表")
+def download(url: str) -> str:
+    print(f"[INFO] Download: {url}")
+    resp = requests.get(
+        url,
+        headers={"User-Agent": USER_AGENT},
+        timeout=TIMEOUT,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+    resp.encoding = resp.encoding or "utf-8"
+    return resp.text
 
 
 def strip_inline_comment(line: str) -> str:
-    line = line.strip().strip("'\"")
-    for sep in (" #", " ;", " //"):
-        if sep in line:
-            line = line.split(sep, 1)[0].strip()
+    # Do not treat "http://", "https://", or AdGuard "##" as comments.
+    for marker in (" #", "\t#", " //", "\t//"):
+        pos = line.find(marker)
+        if pos >= 0:
+            return line[:pos].strip()
     return line.strip()
 
 
-def is_cidr(value: str) -> bool:
+def extract_yaml_payload(text: str) -> tuple[list[str], str | None]:
     try:
-        ipaddress.ip_network(value, strict=False)
-        return True
-    except ValueError:
-        return False
+        data = yaml.safe_load(text)
+    except Exception:
+        return [], None
+
+    if data is None:
+        return [], None
+
+    if isinstance(data, dict):
+        behavior = data.get("behavior")
+        payload = data.get("payload")
+        if isinstance(payload, list):
+            return [str(x).strip() for x in payload if str(x).strip()], (
+                str(behavior).lower() if behavior else None
+            )
+
+        # Some files are complete provider maps: name: {payload: [...]}
+        collected: list[str] = []
+        detected_behavior: str | None = None
+        for value in data.values():
+            if isinstance(value, dict) and isinstance(value.get("payload"), list):
+                collected.extend(str(x).strip() for x in value["payload"] if str(x).strip())
+                if not detected_behavior and value.get("behavior"):
+                    detected_behavior = str(value["behavior"]).lower()
+        if collected:
+            return collected, detected_behavior
+
+    if isinstance(data, list):
+        return [str(x).strip() for x in data if str(x).strip()], None
+
+    return [], None
 
 
-def looks_like_domain(value: str) -> bool:
+def is_ip_or_cidr(value: str) -> str | None:
+    value = value.strip().strip("'\"")
     if not value:
-        return False
-    value = value.strip().lstrip(".").strip()
-    if not value or " " in value or "/" in value:
-        return False
-    return "." in value
+        return None
+
+    try:
+        if "/" in value:
+            net = ipaddress.ip_network(value, strict=False)
+            return str(net)
+        ip = ipaddress.ip_address(value)
+        return f"{ip}/32" if ip.version == 4 else f"{ip}/128"
+    except ValueError:
+        return None
 
 
-def normalize_domain_value(value: str) -> str:
-    return value.strip().strip("'\"")
+def normalize_domain(value: str) -> str | None:
+    v = value.strip().strip("'\"").lower().rstrip(".")
+    if not v:
+        return None
+
+    # AdGuard style: ||example.com^
+    if v.startswith("@@"):
+        return None
+    if v.startswith("||"):
+        v = v[2:]
+        v = re.split(r"[\^/$]", v, 1)[0].strip(".")
+        if v:
+            return f"+.{v}"
+
+    # hosts style: 0.0.0.0 example.com or ::1 example.com
+    parts = v.split()
+    if len(parts) >= 2 and is_ip_or_cidr(parts[0]):
+        v = parts[1].strip().rstrip(".")
+
+    # Wildcard domain.
+    if v.startswith("*."):
+        v = "+." + v[2:]
+
+    if v.startswith("."):
+        v = "+." + v[1:]
+
+    # Drop obvious unsupported rule syntaxes.
+    if any(ch in v for ch in ("/", "\\", ":", "@", "[", "]")):
+        return None
+    if v.startswith(("regexp:", "keyword:", "full:")):
+        return None
+
+    # '+.example.com' or 'example.com'
+    candidate = v[2:] if v.startswith("+.") else v
+    labels = candidate.split(".")
+    if len(labels) < 2:
+        return None
+    if not all(re.fullmatch(r"[a-z0-9-]{1,63}", label) for label in labels):
+        return None
+    if labels[-1].isdigit():
+        return None
+    return v
 
 
-def split_mixed_entries(entries: Sequence[str]) -> SplitResult:
-    domains: List[str] = []
-    ipcidrs: List[str] = []
-    skipped: List[str] = []
-    seen_domain = set()
-    seen_ipcidr = set()
+def parse_rule_line(line: str) -> tuple[str | None, str | None]:
+    """
+    Return (kind, value)
+      kind: domain / ipcidr / None
+    """
+    line = strip_inline_comment(line.strip())
+    if not line:
+        return None, None
 
-    for raw in entries:
-        line = strip_inline_comment(str(raw))
-        if not line or line.startswith("#"):
-            continue
+    # Remove YAML list marker.
+    if line.startswith("- "):
+        line = line[2:].strip()
 
-        if "," not in line:
-            if is_cidr(line):
-                if line not in seen_ipcidr:
-                    ipcidrs.append(line)
-                    seen_ipcidr.add(line)
-            elif looks_like_domain(line):
-                domain = normalize_domain_value(line)
-                if domain and domain not in seen_domain:
-                    domains.append(domain)
-                    seen_domain.add(domain)
+    line = line.strip().strip("'\"")
+    if not line:
+        return None, None
+
+    # Drop comments / headers / unsupported AdGuard cosmetic rules.
+    low = line.lower()
+    if (
+        line.startswith(("#", ";", "//", "["))
+        or "##" in line
+        or "#@#" in line
+        or low.startswith(("payload:", "rules:", "rule-providers:", "behavior:", "format:"))
+    ):
+        return None, None
+
+    # Clash/Mihomo classical rule line.
+    # DOMAIN-SUFFIX,example.com,PROXY
+    if "," in line:
+        fields = [x.strip().strip("'\"") for x in line.split(",")]
+        key = fields[0].upper()
+        if key in RULE_PREFIXES_DOMAIN and len(fields) >= 2:
+            if key == "DOMAIN":
+                domain = normalize_domain(fields[1])
+            elif key == "DOMAIN-SUFFIX":
+                d = normalize_domain(fields[1])
+                domain = f"+.{d[2:] if d and d.startswith('+.') else d}" if d else None
             else:
-                skipped.append(line)
-            continue
+                # DOMAIN-KEYWORD / DOMAIN-REGEX / GEOSITE / process rules are not mrs-domain payload.
+                domain = None
+            return ("domain", domain) if domain else (None, None)
 
-        parts = [p.strip() for p in line.split(",")]
-        rule_type = parts[0].upper()
-        value = parts[1] if len(parts) > 1 else ""
+        if key in RULE_PREFIXES_IP and len(fields) >= 2:
+            cidr = is_ip_or_cidr(fields[1])
+            return ("ipcidr", cidr) if cidr else (None, None)
 
-        if rule_type in {"IP-CIDR", "IP-CIDR6"}:
-            if is_cidr(value) and value not in seen_ipcidr:
-                ipcidrs.append(value)
-                seen_ipcidr.add(value)
-            else:
-                skipped.append(line)
-            continue
+    cidr = is_ip_or_cidr(line)
+    if cidr:
+        return "ipcidr", cidr
 
-        if rule_type == "DOMAIN":
-            domain = normalize_domain_value(value)
-            if looks_like_domain(domain) and domain not in seen_domain:
-                domains.append(domain)
-                seen_domain.add(domain)
-            else:
-                skipped.append(line)
-            continue
+    domain = normalize_domain(line)
+    if domain:
+        return "domain", domain
 
-        if rule_type == "DOMAIN-SUFFIX":
-            domain = normalize_domain_value(value)
-            if looks_like_domain(domain):
-                if not domain.startswith((".", "*")):
-                    domain = "." + domain
-                if domain not in seen_domain:
-                    domains.append(domain)
-                    seen_domain.add(domain)
-            else:
-                skipped.append(line)
-            continue
-
-        skipped.append(line)
-
-    return SplitResult(domains=domains, ipcidrs=ipcidrs, skipped=skipped)
+    return None, None
 
 
-def write_text_rules(path: Path, rules: Iterable[str]) -> None:
-    values = list(rules)
-    path.write_text(("\n".join(values) + "\n") if values else "", encoding="utf-8")
+def unique_sorted(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return sorted(out)
 
 
-def update_hash_message(output_path: Path, old_hash: str | None) -> None:
-    new_hash = sha256sum(output_path)
-    if old_hash == new_hash:
-        print(f"[OK] {output_path.name}: 无变化")
-    else:
-        print(f"[OK] {output_path.name}: 已更新")
+def collect_rules(text: str) -> tuple[list[str], list[str], str | None]:
+    payload, yaml_behavior = extract_yaml_payload(text)
+    lines = payload if payload else text.splitlines()
+
+    domains: list[str] = []
+    cidrs: list[str] = []
+
+    for raw in lines:
+        kind, value = parse_rule_line(str(raw))
+        if kind == "domain" and value:
+            domains.append(value)
+        elif kind == "ipcidr" and value:
+            cidrs.append(value)
+
+    return unique_sorted(domains), unique_sorted(cidrs), yaml_behavior
 
 
-def remove_if_exists(path: Path) -> None:
-    if path.exists():
-        path.unlink()
-        print(f"[INFO] 已删除空产物: {path.relative_to(ROOT)}")
+def write_text_rules(path: Path, payload: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(payload) + "\n", encoding="utf-8")
 
 
-def process_single_behavior(mihomo_bin: str, item: RuleItem, source_path: Path, tmpdir_path: Path) -> None:
-    suffix = ".yaml" if item.input_fmt == "yaml" else ".txt"
-    temp_input = tmpdir_path / f"{item.name}{suffix}"
-    shutil.copyfile(source_path, temp_input)
-
-    output_path = OUTPUT_DIR / f"{item.name}.mrs"
-    old_hash = sha256sum(output_path) if output_path.exists() else None
-
-    print(f"[INFO] 转换: {item.name} ({item.mode}, {item.input_fmt}) -> {output_path.relative_to(ROOT)}")
-    convert_rule(mihomo_bin, item.mode, item.input_fmt, temp_input, output_path)
-    update_hash_message(output_path, old_hash)
+def convert_with_mihomo(behavior: str, src: Path, dst: Path) -> None:
+    cmd = [str(MIHOMO_BIN), "convert-ruleset", behavior, "text", str(src), str(dst)]
+    print("[INFO] Run:", " ".join(cmd))
+    subprocess.run(cmd, cwd=str(ROOT), check=True)
 
 
-def process_mixed_behavior(mihomo_bin: str, item: RuleItem, source_path: Path) -> None:
-    entries = read_source_entries(source_path, item.input_fmt)
-    split = split_mixed_entries(entries)
-
-    if split.skipped:
-        print(f"[WARN] {item.name}: 跳过 {len(split.skipped)} 条不能映射到 domain/ipcidr 的规则，例如: {split.skipped[0]}")
-
-    domain_output = OUTPUT_DIR / f"{item.name}_domain.mrs"
-    ip_output = OUTPUT_DIR / f"{item.name}_ipcidr.mrs"
-
-    with tempfile.TemporaryDirectory(prefix=f"{item.name}-split-") as td:
-        td = Path(td)
-
-        if split.domains:
-            domain_input = td / f"{item.name}_domain.txt"
-            write_text_rules(domain_input, split.domains)
-            old_hash = sha256sum(domain_output) if domain_output.exists() else None
-            print(f"[INFO] 转换: {item.name} mixed -> {domain_output.relative_to(ROOT)} (domain {len(split.domains)} 条)")
-            convert_rule(mihomo_bin, "domain", "text", domain_input, domain_output)
-            update_hash_message(domain_output, old_hash)
-        else:
-            remove_if_exists(domain_output)
-            print(f"[INFO] {item.name}: 未识别到可转换的 domain 规则")
-
-        if split.ipcidrs:
-            ip_input = td / f"{item.name}_ipcidr.txt"
-            write_text_rules(ip_input, split.ipcidrs)
-            old_hash = sha256sum(ip_output) if ip_output.exists() else None
-            print(f"[INFO] 转换: {item.name} mixed -> {ip_output.relative_to(ROOT)} (ipcidr {len(split.ipcidrs)} 条)")
-            convert_rule(mihomo_bin, "ipcidr", "text", ip_input, ip_output)
-            update_hash_message(ip_output, old_hash)
-        else:
-            remove_if_exists(ip_output)
-            print(f"[INFO] {item.name}: 未识别到可转换的 ipcidr 规则")
-
-    if not split.domains and not split.ipcidrs:
-        raise RuntimeError("未从 mixed 源中识别出任何可转换的 domain/ipcidr 规则")
+def clean_output() -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    for pattern in ("*.mrs", "*.json"):
+        for p in OUT_DIR.glob(pattern):
+            p.unlink()
 
 
 def main() -> int:
-    try:
-        mihomo_bin = ensure_mihomo()
-        items = parse_links(LINKS_FILE)
-    except Exception as e:
-        print(f"[FATAL] {e}", file=sys.stderr)
-        return 1
+    if not MIHOMO_BIN.exists():
+        die(f"找不到 mihomo 可执行文件：{MIHOMO_BIN}")
 
-    if not items:
-        return 0
+    items = parse_links(LINKS_FILE)
+    clean_output()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    success = 0
-    failed = 0
+    manifest: dict[str, object] = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "items": [],
+    }
 
-    with tempfile.TemporaryDirectory(prefix="mihomo-mrs-auto-") as tmpdir:
-        tmpdir_path = Path(tmpdir)
+    with tempfile.TemporaryDirectory(prefix="mrs-build-") as td:
+        tmp = Path(td)
 
         for item in items:
+            entry: dict[str, object] = {
+                "url": item.url,
+                "name": item.name,
+                "behavior": item.behavior,
+                "outputs": [],
+                "skipped": [],
+            }
+
             try:
-                suffix = ".yaml" if item.input_fmt == "yaml" else ".txt"
-                source_path = tmpdir_path / f"{item.name}_source{suffix}"
-                print(f"[INFO] 下载: {item.url}")
-                download_file(item.url, source_path)
+                text = download(item.url)
+                domains, cidrs, yaml_behavior = collect_rules(text)
 
-                if item.mode in {"domain", "ipcidr"}:
-                    process_single_behavior(mihomo_bin, item, source_path, tmpdir_path)
+                # If links.txt says auto and the YAML declares behavior, honor it unless unsupported.
+                wanted = item.behavior
+                if wanted == "auto" and yaml_behavior in {"domain", "ipcidr"}:
+                    wanted = yaml_behavior
+
+                jobs: list[tuple[str, list[str], str]]
+                if wanted == "domain":
+                    jobs = [("domain", domains, f"{item.name}.mrs")]
+                elif wanted == "ipcidr":
+                    jobs = [("ipcidr", cidrs, f"{item.name}.mrs")]
                 else:
-                    process_mixed_behavior(mihomo_bin, item, source_path)
+                    jobs = []
+                    if domains:
+                        suffix = "-domain" if cidrs else ""
+                        jobs.append(("domain", domains, f"{item.name}{suffix}.mrs"))
+                    if cidrs:
+                        suffix = "-ipcidr" if domains else ""
+                        jobs.append(("ipcidr", cidrs, f"{item.name}{suffix}.mrs"))
 
-                success += 1
-            except Exception as e:
-                failed += 1
-                print(f"[ERROR] {item.name}: {e}", file=sys.stderr)
+                if not jobs:
+                    entry["skipped"] = ["no supported domain/ipcidr payload detected"]
+                    print(f"[WARN] {item.name}: 没有检测到可转换的 domain/ipcidr 规则")
+                else:
+                    for behavior, payload, out_name in jobs:
+                        if not payload:
+                            entry["skipped"].append(f"{behavior}: empty")
+                            continue
 
-    print(f"[DONE] 成功: {success}，失败: {failed}")
-    return 1 if failed > 0 else 0
+                        src = tmp / f"{item.name}-{behavior}.txt"
+                        dst = OUT_DIR / out_name
+                        write_text_rules(src, payload)
+                        convert_with_mihomo(behavior, src, dst)
+
+                        entry["outputs"].append(
+                            {
+                                "file": str(dst.relative_to(ROOT)).replace("\\", "/"),
+                                "behavior": behavior,
+                                "count": len(payload),
+                            }
+                        )
+
+            except Exception as exc:
+                entry["error"] = str(exc)
+                print(f"[ERROR] {item.name}: {exc}", file=sys.stderr)
+
+            manifest["items"].append(entry)
+
+    (OUT_DIR / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    errors = [x for x in manifest["items"] if isinstance(x, dict) and x.get("error")]
+    if errors:
+        print(f"[WARN] 有 {len(errors)} 个源转换失败，其他源已继续处理。")
+        # Return 0 so one failed upstream URL does not block all successful output.
+    return 0
 
 
 if __name__ == "__main__":
