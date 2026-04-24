@@ -1,0 +1,95 @@
+name: Build mihomo MRS rules
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天北京时间 06:00 自动运行
+    - cron: "0 6 * * *"
+      timezone: "Asia/Shanghai"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mihomo-mrs
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyyaml
+
+      - name: Download latest mihomo
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+
+          python - <<'PY' > /tmp/mihomo_download_url
+          import json
+          import re
+          import sys
+          import urllib.request
+
+          api = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+          with urllib.request.urlopen(api) as r:
+              data = json.load(r)
+
+          assets = data.get("assets", [])
+          patterns = [
+              r"^mihomo-linux-amd64-compatible-v[\w.\-]+\.gz$",
+              r"^mihomo-linux-amd64-v[\w.\-]+\.gz$",
+              r"^mihomo-linux-amd64-.*\.gz$",
+          ]
+
+          for pat in patterns:
+              for asset in assets:
+                  if re.match(pat, asset.get("name", "")):
+                      print(asset["browser_download_url"])
+                      raise SystemExit(0)
+
+          print("No suitable linux-amd64 mihomo asset found", file=sys.stderr)
+          print([a.get("name") for a in assets], file=sys.stderr)
+          raise SystemExit(1)
+          PY
+
+          url="$(cat /tmp/mihomo_download_url)"
+          echo "Downloading: $url"
+          curl -fsSL "$url" -o /tmp/mihomo.gz
+          gzip -dc /tmp/mihomo.gz > bin/mihomo
+          chmod +x bin/mihomo
+          ./bin/mihomo -v
+
+      - name: Convert rule sets to MRS
+        env:
+          MIHOMO_BIN: ./bin/mihomo
+        run: |
+          python scripts/build_mrs.py
+
+      - name: Commit generated MRS files
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add rule/mihomo
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update mihomo mrs rules"
+            git push
+          fi
