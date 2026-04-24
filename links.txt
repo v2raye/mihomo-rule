@@ -1,2 +1,4 @@
 https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/CN.list
 https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/Telegram.list
+https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/ai.list
+https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/YouTube.list
