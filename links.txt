@@ -1,5 +1,1 @@
-# https://example.com/domain.yaml|my-domain|domain
-# https://example.com/ipcidr.yaml|my-ip|ipcidr
-# https://example.com/mixed.list|mixed|auto
-
-https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/CN.list|my-domain|domain
+https://raw.githubusercontent.com/v2raye/sub/refs/heads/main/Surge/CN.list
