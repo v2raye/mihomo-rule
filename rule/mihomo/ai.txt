@@ -18,6 +18,7 @@ workos.imgix.net
 .intercomcdn.com
 js.stripe.com
 .ct.sendgrid.net
-.ingest.sentry.io
+.sentry.io
 rum.browser-intake-datadoghq.com
+.nel.cloudflare.com
 humb.apple.com
