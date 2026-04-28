@@ -3,6 +3,7 @@
 .cloudflareresolve.com
 .cloudflareinsights.com
 .cloudflarestream.com
+.nel.cloudflare.com
 .workers.dev
 .pages.dev
 .r2.dev
