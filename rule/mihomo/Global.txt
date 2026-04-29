@@ -518,3 +518,9 @@
 .xvideos-cdn.com
 .xvideos.com
 .ypncdn.com
+.garmin.cn
+.garmin.com.cn
+.garmincdn.com
+.flygarmin.com
+.activecaptain.com
+.navionics.com
