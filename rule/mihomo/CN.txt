@@ -1,4 +1,4 @@
-api.mijia.tech
+.api.mijia.tech
 upos-hz-mirrorakam.akamaized.net
 .10010.com
 .10086.cn
@@ -590,5 +590,6 @@ upos-hz-mirrorakam.akamaized.net
 .yumchina.com
 .yupaowang.com
 .zte.com.cn
+.boowayun.com
 .cnpc.com.cn
 .cn
