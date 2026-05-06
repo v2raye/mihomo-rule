@@ -52,21 +52,21 @@ jobs:
 
           api = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
 
-          with urllib.request.urlopen(api) as r:
+          with urllib.request.urlopen(api, timeout=60) as r:
               data = json.load(r)
 
           assets = data.get("assets", [])
-
           candidates = []
 
           for asset in assets:
               name = asset.get("name", "")
               url = asset.get("browser_download_url", "")
+              lower = name.lower()
 
               if (
-                  "linux-amd64" in name
-                  and name.endswith(".gz")
-                  and "alpha" not in name.lower()
+                  "linux-amd64" in lower
+                  and lower.endswith(".gz")
+                  and "alpha" not in lower
               ):
                   candidates.append((name, url))
 
@@ -74,7 +74,7 @@ jobs:
               raise SystemExit("没有找到 mihomo linux-amd64 .gz 下载文件")
 
           # 优先 compatible，兼容性最好
-          candidates.sort(key=lambda x: ("compatible" not in x[0], x[0]))
+          candidates.sort(key=lambda x: ("compatible" not in x[0].lower(), x[0]))
 
           name, url = candidates[0]
 
@@ -86,7 +86,7 @@ jobs:
 
           MIHOMO_URL="$(cat mihomo_asset_url.txt)"
 
-          curl -fsSL "$MIHOMO_URL" -o mihomo.gz
+          curl -fsSL --retry 3 "$MIHOMO_URL" -o mihomo.gz
           gzip -dc mihomo.gz > bin/mihomo
           chmod +x bin/mihomo
 
@@ -112,12 +112,16 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 如果旧版本已经提交过 manifest.json，这里自动从 Git 跟踪中删除
+          # 如果旧版本提交过 manifest.json，自动从 Git 跟踪中删除
           git rm --ignore-unmatch rule/mihomo/manifest.json || true
           rm -f rule/mihomo/manifest.json
 
-          # 只提交 .mrs 和 .txt
-          find rule/mihomo -maxdepth 1 \( -name "*.mrs" -o -name "*.txt" \) -print0 | xargs -0 -r git add
+          # 提交 rule/mihomo 下新增、修改、删除
+          # 这样 links.txt 删除某个链接后，对应旧 .mrs/.txt 也会被删除
+          git add -A rule/mihomo
+
+          # 双保险：不允许 manifest.json 进入提交
+          git reset -- rule/mihomo/manifest.json 2>/dev/null || true
 
           if git diff --cached --quiet; then
             echo "没有 .mrs 或 .txt 规则变化，不需要提交。"
