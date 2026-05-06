@@ -1,6 +1,5 @@
 .apple.com
 .apple.com.cn
-.apple
 .apple.co
 .appsto.re
 .appstore.com

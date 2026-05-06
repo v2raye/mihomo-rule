@@ -592,4 +592,3 @@ upos-hz-mirrorakam.akamaized.net
 .zte.com.cn
 .boowayun.com
 .cnpc.com.cn
-.cn

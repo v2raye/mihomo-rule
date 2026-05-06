@@ -52,7 +52,6 @@ fonts.gstatic.com
 .blogger.com
 .blogspot.com
 sites.google.com
-.new
 .page.link
 .googleadservices.com
 .doubleclick.net
