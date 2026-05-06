@@ -21,6 +21,7 @@ MIHOMO_BIN = os.environ.get("MIHOMO_BIN", str(ROOT_DIR / "bin" / "mihomo"))
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# 可以安全转换进 mihomo behavior=domain 的 classical 规则
 DOMAIN_RULE_TYPES = {
     "DOMAIN",
     "DOMAIN-SUFFIX",
@@ -31,22 +32,34 @@ DOMAIN_RULE_TYPES = {
     "HOST-KEYWORD",
 }
 
+
+# 只转换目标 IP CIDR。
+# SRC-IP-CIDR 是源地址匹配，不能混进普通 ipcidr.mrs。
 IP_RULE_TYPES = {
     "IP-CIDR",
     "IP-CIDR6",
-    "SRC-IP-CIDR",
-    "SRC-IP-CIDR6",
 }
 
 
+# 这些规则无法完整表达为 mrs domain/ipcidr，统一跳过
 SKIP_RULE_TYPES = {
     "GEOIP",
     "GEOSITE",
     "IP-ASN",
+    "SRC-GEOIP",
     "SRC-IP-ASN",
+    "SRC-IP-CIDR",
+    "SRC-IP-CIDR6",
+    "SRC-IP-SUFFIX",
+    "IP-SUFFIX",
+    "DOMAIN-REGEX",
+    "URL-REGEX",
     "PROCESS-NAME",
     "PROCESS-PATH",
+    "PROCESS-PATH-WILDCARD",
     "PROCESS-PATH-REGEX",
+    "PROCESS-NAME-WILDCARD",
+    "PROCESS-NAME-REGEX",
     "DST-PORT",
     "SRC-PORT",
     "IN-PORT",
@@ -55,6 +68,7 @@ SKIP_RULE_TYPES = {
     "IN-NAME",
     "NETWORK",
     "UID",
+    "DSCP",
     "RULE-SET",
     "SUB-RULE",
     "MATCH",
@@ -82,12 +96,12 @@ def read_links() -> list[str]:
             continue
 
         # 允许行尾注释：
-        # https://example.com/a.yaml # comment
+        # https://example.com/private.yaml # comment
         line = line.split(" #", 1)[0].strip()
 
         # 兼容旧写法：
-        # https://example.com/a.yaml|name|domain
-        # 现在只取链接本体，输出名自动从 URL 文件名识别
+        # https://example.com/private.yaml|private|ipcidr
+        # 现在只取链接本体，输出名统一从 URL 文件名自动识别
         line = line.split("|", 1)[0].strip()
 
         if not line.startswith(("https://", "http://")):
@@ -117,6 +131,7 @@ def filename_from_url(url: str) -> str:
             filename = filename[: -len(suffix)]
             break
 
+    # 防止 URL 文件名里有不适合作为文件名的字符
     filename = re.sub(r"[^\w.\-]+", "_", filename)
 
     return filename
@@ -136,7 +151,7 @@ def stem_from_url(url: str) -> str:
 def unique_path(path: Path, used: set[Path]) -> Path:
     """
     同一次运行内避免多个链接生成同名文件。
-    注意：已有文件允许覆盖，这样每天更新不会变成 xxx-2.mrs。
+    已存在的同名文件允许覆盖，这样每天更新不会变成 xxx-2.mrs。
     """
     if path not in used:
         used.add(path)
@@ -146,22 +161,34 @@ def unique_path(path: Path, used: set[Path]) -> Path:
     suffix = path.suffix
     parent = path.parent
 
-    i = 2
+    index = 2
 
     while True:
-        candidate = parent / f"{stem}-{i}{suffix}"
+        candidate = parent / f"{stem}-{index}{suffix}"
 
         if candidate not in used:
             used.add(candidate)
             return candidate
 
-        i += 1
+        index += 1
+
+
+def clean_output_dir() -> None:
+    """
+    每次重新生成，避免 links.txt 删除链接后旧文件残留。
+    只清理本项目自动生成的 .mrs / .txt / .tmp / manifest.json。
+    """
+    for pattern in ("*.mrs", "*.txt", "*.tmp", "manifest.json"):
+        for old_file in OUT_DIR.glob(pattern):
+            if old_file.is_file():
+                old_file.unlink()
+                log(f"删除旧文件: {old_file.relative_to(ROOT_DIR)}")
 
 
 def download(url: str, dst: Path) -> None:
     log(f"下载: {url}")
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         url,
         headers={
             "User-Agent": "mihomo-mrs-auto-convert/1.0",
@@ -169,7 +196,7 @@ def download(url: str, dst: Path) -> None:
         },
     )
 
-    with urllib.request.urlopen(req, timeout=90) as response:
+    with urllib.request.urlopen(request, timeout=90) as response:
         data = response.read()
 
     if url.lower().endswith((".gz", ".gzip")):
@@ -179,7 +206,7 @@ def download(url: str, dst: Path) -> None:
 
 
 def strip_inline_comment(line: str) -> str:
-    # 只去掉空格后的 # 注释，避免误伤正则或特殊规则
+    # 只去掉空格后的 # 注释，避免误伤正则、通配符或特殊规则
     return line.split(" #", 1)[0].strip()
 
 
@@ -198,7 +225,7 @@ def normalize_yaml_or_text_line(raw: str) -> str:
     if not line:
         return ""
 
-    if line.startswith("#"):
+    if line.startswith(("#", ";", "!", "//")):
         return ""
 
     line = strip_inline_comment(line)
@@ -232,29 +259,56 @@ def is_ip_cidr(value: str) -> bool:
         return False
 
 
-def is_plain_domain(value: str) -> bool:
+def is_ip_address(value: str) -> bool:
+    value = value.strip()
+
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def is_domain_provider_item(value: str) -> bool:
+    """
+    mihomo domain provider 文本规则：
+    - example.com
+    - .example.com
+    - *.example.com
+    - *.*.example.com
+    - *keyword*
+    这里做基础合法性过滤，真正语法由 mihomo convert-ruleset 再校验。
+    """
     value = value.strip()
 
     if not value:
         return False
 
-    if " " in value or "/" in value:
+    if "," in value or " " in value or "\t" in value or "/" in value:
         return False
 
     if value.startswith(("http://", "https://")):
         return False
 
-    # mihomo domain rule-provider 常见写法
-    if value.startswith(("+.", ".", "*.")):
-        return True
+    if is_ip_address(value):
+        return False
 
+    # 兼容部分 Clash 规则源里的 +.example.com
+    if value.startswith("+."):
+        return bool(re.search(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$", value[2:]))
+
+    # 后缀写法：.example.com
+    if value.startswith("."):
+        return bool(re.search(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$", value[1:]))
+
+    # wildcard / keyword 近似写法
     if "*" in value:
-        return True
+        return bool(re.search(r"[A-Za-z0-9]", value)) and bool(
+            re.fullmatch(r"[A-Za-z0-9*_.+\-]+", value)
+        )
 
-    if value.startswith(("full:", "domain:", "keyword:", "regexp:")):
-        return True
-
-    return bool(re.search(r"^[A-Za-z0-9_.+\-:*]+\.[A-Za-z0-9_.+\-:*]+$", value))
+    # 普通完整域名
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]+", value))
 
 
 def convert_classical_domain(rule_type: str, value: str) -> str | None:
@@ -265,17 +319,121 @@ def convert_classical_domain(rule_type: str, value: str) -> str | None:
         return None
 
     if rule_type in {"DOMAIN", "HOST"}:
-        return value
+        item = value
 
-    if rule_type in {"DOMAIN-SUFFIX", "HOST-SUFFIX"}:
+    elif rule_type in {"DOMAIN-SUFFIX", "HOST-SUFFIX"}:
         value = value.lstrip(".")
-        return f".{value}"
+        item = f".{value}"
 
-    if rule_type in {"DOMAIN-KEYWORD", "HOST-KEYWORD"}:
-        return f"*{value}*"
+    elif rule_type in {"DOMAIN-KEYWORD", "HOST-KEYWORD"}:
+        # 近似转换：DOMAIN-KEYWORD,google -> *google*
+        # mihomo domain provider 使用 Clash wildcard。
+        # 这不是 classical 的 100% 等价，但比直接丢弃更适合自动转换场景。
+        if any(ch in value for ch in (" ", ",", "/", "\\")):
+            return None
+        item = f"*{value}*"
 
-    if rule_type == "DOMAIN-WILDCARD":
-        return value
+    elif rule_type == "DOMAIN-WILDCARD":
+        item = value
+
+    else:
+        return None
+
+    if is_domain_provider_item(item):
+        return item
+
+    return None
+
+
+def convert_geosite_like_line(line: str) -> str | None:
+    """
+    兼容部分 geosite 源格式：
+    full:example.com
+    domain:example.com
+    keyword:google
+    """
+    lower = line.lower()
+
+    if lower.startswith("full:"):
+        item = line.split(":", 1)[1].strip()
+
+    elif lower.startswith("domain:"):
+        item = "." + line.split(":", 1)[1].strip().lstrip(".")
+
+    elif lower.startswith("keyword:"):
+        keyword = line.split(":", 1)[1].strip()
+
+        if any(ch in keyword for ch in (" ", ",", "/", "\\")):
+            return None
+
+        item = f"*{keyword}*"
+
+    elif lower.startswith("regexp:"):
+        return None
+
+    else:
+        return None
+
+    if is_domain_provider_item(item):
+        return item
+
+    return None
+
+
+def convert_adblock_like_line(line: str) -> str | None:
+    """
+    简单兼容 AdGuard / ABP 域名锚定规则：
+    ||example.com^ -> .example.com
+
+    只转换最常见、可安全映射的域名锚定形式；
+    复杂 cosmetic / regex / allowlist 规则全部跳过。
+    """
+    if line.startswith("@@"):
+        return None
+
+    if not line.startswith("||"):
+        return None
+
+    body = line[2:]
+
+    # 去掉 ABP 结尾锚点和参数
+    body = body.split("^", 1)[0]
+    body = body.split("$", 1)[0]
+    body = body.strip()
+
+    if not body:
+        return None
+
+    if body.startswith("*") or "/" in body or ":" in body:
+        return None
+
+    item = "." + body.lstrip(".")
+
+    if is_domain_provider_item(item):
+        return item
+
+    return None
+
+
+def convert_hosts_line(line: str) -> str | None:
+    """
+    兼容 hosts 格式：
+    0.0.0.0 example.com
+    127.0.0.1 example.com
+    """
+    parts = line.split()
+
+    if len(parts) < 2:
+        return None
+
+    first = parts[0].strip()
+    second = parts[1].strip()
+
+    if not is_ip_address(first):
+        return None
+
+    if is_domain_provider_item(second):
+        return second
 
     return None
 
@@ -294,7 +452,7 @@ def parse_rules(path: Path) -> tuple[list[str], list[str], list[str]]:
         if not line:
             continue
 
-        # 兼容 Surge / Clash classical:
+        # 兼容 Surge / Clash classical：
         # DOMAIN-SUFFIX,example.com
         # IP-CIDR,1.1.1.0/24,no-resolve
         parts = [p.strip() for p in line.split(",")]
@@ -306,11 +464,13 @@ def parse_rules(path: Path) -> tuple[list[str], list[str], list[str]]:
             if item and item not in seen_domains:
                 domains.append(item)
                 seen_domains.add(item)
+            elif not item:
+                skipped.append(line)
 
             continue
 
         if head in IP_RULE_TYPES and len(parts) >= 2:
-            item = parts[1]
+            item = parts[1].strip()
 
             if is_ip_cidr(item) and item not in seen_ipcidrs:
                 ipcidrs.append(item)
@@ -324,42 +484,44 @@ def parse_rules(path: Path) -> tuple[list[str], list[str], list[str]]:
             skipped.append(line)
             continue
 
-        # 兼容部分 geosite 源格式：
-        # full:example.com
-        # domain:example.com
-        # keyword:google
-        lower = line.lower()
+        # 兼容：192.168.0.0/16,no-resolve
+        if len(parts) >= 2 and is_ip_cidr(parts[0]):
+            item = parts[0]
 
-        if lower.startswith("full:"):
-            item = line.split(":", 1)[1].strip()
-
-            if item and item not in seen_domains:
-                domains.append(item)
-                seen_domains.add(item)
+            if item not in seen_ipcidrs:
+                ipcidrs.append(item)
+                seen_ipcidrs.add(item)
 
             continue
 
-        if lower.startswith("domain:"):
-            item = "." + line.split(":", 1)[1].strip().lstrip(".")
+        # 兼容 geosite-like 行
+        geosite_item = convert_geosite_like_line(line)
 
-            if item and item not in seen_domains:
-                domains.append(item)
-                seen_domains.add(item)
-
-            continue
-
-        if lower.startswith("keyword:"):
-            item = "*" + line.split(":", 1)[1].strip() + "*"
-
-            if item and item not in seen_domains:
-                domains.append(item)
-                seen_domains.add(item)
+        if geosite_item:
+            if geosite_item not in seen_domains:
+                domains.append(geosite_item)
+                seen_domains.add(geosite_item)
 
             continue
 
-        if lower.startswith("regexp:"):
-            # domain behavior 不是 classical，regexp 不稳定，跳过
-            skipped.append(line)
+        # 兼容 AdGuard / ABP 简单域名规则
+        adblock_item = convert_adblock_like_line(line)
+
+        if adblock_item:
+            if adblock_item not in seen_domains:
+                domains.append(adblock_item)
+                seen_domains.add(adblock_item)
+
+            continue
+
+        # 兼容 hosts
+        hosts_item = convert_hosts_line(line)
+
+        if hosts_item:
+            if hosts_item not in seen_domains:
+                domains.append(hosts_item)
+                seen_domains.add(hosts_item)
+
             continue
 
         # 纯 CIDR
@@ -370,8 +532,8 @@ def parse_rules(path: Path) -> tuple[list[str], list[str], list[str]]:
 
             continue
 
-        # 纯域名 / wildcard
-        if is_plain_domain(line):
+        # 纯 domain provider item
+        if is_domain_provider_item(line):
             if line not in seen_domains:
                 domains.append(line)
                 seen_domains.add(line)
@@ -415,15 +577,18 @@ def run_convert(behavior: str, txt_file: Path, mrs_file: Path) -> None:
 def build_one(url: str, tmpdir: Path, used_outputs: set[Path]) -> None:
     filename = filename_from_url(url)
     stem = stem_from_url(url)
-
     source_file = tmpdir / filename
 
     download(url, source_file)
 
     domains, ipcidrs, skipped = parse_rules(source_file)
 
+    log(
+        f"{filename}: domain={len(domains)}, ipcidr={len(ipcidrs)}, skipped={len(skipped)}"
+    )
+
     if skipped:
-        log(f"{filename}: 跳过 {len(skipped)} 条不适合 domain/ipcidr mrs 的规则")
+        log(f"{filename}: 已跳过 {len(skipped)} 条无法转换为 domain/ipcidr mrs 的规则")
 
     outputs: list[tuple[str, list[str], str]] = []
 
@@ -459,11 +624,7 @@ def main() -> None:
     if not os.access(mihomo_path, os.X_OK):
         die(f"mihomo 没有执行权限: {MIHOMO_BIN}")
 
-    # 不生成 manifest.json；如果旧版本残留，直接删除
-    manifest = OUT_DIR / "manifest.json"
-
-    if manifest.exists():
-        manifest.unlink()
+    clean_output_dir()
 
     links = read_links()
     used_outputs: set[Path] = set()
