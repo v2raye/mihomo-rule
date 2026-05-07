@@ -8,6 +8,7 @@
 .verily.com
 .verilylifesciences.com
 .deepmind.com
+.google.com
 .g.cn
 .g.co
 .g.dev
