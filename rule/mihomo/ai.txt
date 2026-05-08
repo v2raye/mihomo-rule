@@ -1,3 +1,4 @@
+chatgpt.com
 .chatgpt.com
 .openai.com
 .oaistatic.com
