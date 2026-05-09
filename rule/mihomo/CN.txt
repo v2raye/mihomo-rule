@@ -404,8 +404,6 @@ upos-hz-mirrorakam.akamaized.net
 .toutiaoapi.com
 .toutiaoimg.cn
 .toutiaoimg.com
-.v2ex.cn
-.v2ex.com
 .youdao.com
 .zhihu.com
 .zhihuishu.com
