@@ -87,6 +87,7 @@
 .mojang.com
 .bethesda.net
 .beth.games
+github.com
 .github.com
 .github.io
 .github.dev
