@@ -399,7 +399,7 @@ upos-hz-mirrorakam.akamaized.net
 .sohu.com.cn
 .sohucs.com
 .tianyancha.com
-.tieba.com
+.tianya.net
 .toutiao.com
 .toutiaoapi.com
 .toutiaoimg.cn
