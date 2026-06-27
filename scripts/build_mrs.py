@@ -6,8 +6,11 @@ import hashlib
 import ipaddress
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -18,7 +21,11 @@ LINKS_FILE = ROOT_DIR / "links.txt"
 OUT_DIR = ROOT_DIR / "rule" / "mihomo"
 MIHOMO_BIN = os.environ.get("MIHOMO_BIN", str(ROOT_DIR / "bin" / "mihomo"))
 
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_RETRIES = 4
+DOWNLOAD_TIMEOUT = 90
+RETRY_BASE_DELAY = 5
+SKIPPED_SAMPLE_LIMIT = 10
+GENERATED_PATTERNS = ("*.mrs", "*.txt", "*.tmp", "manifest.json")
 
 
 # 可以安全转换进 mihomo behavior=domain 的 classical 规则
@@ -81,6 +88,13 @@ def log(message: str) -> None:
 
 def die(message: str) -> None:
     raise SystemExit(f"[build-rules] ERROR: {message}")
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT_DIR))
+    except ValueError:
+        return str(path)
 
 
 def read_links() -> list[str]:
@@ -173,21 +187,11 @@ def unique_path(path: Path, used: set[Path]) -> Path:
         index += 1
 
 
-def clean_output_dir() -> None:
-    """
-    每次重新生成，避免 links.txt 删除链接后旧文件残留。
-    只清理本项目自动生成的 .mrs / .txt / .tmp / manifest.json。
-    """
-    for pattern in ("*.mrs", "*.txt", "*.tmp", "manifest.json"):
-        for old_file in OUT_DIR.glob(pattern):
-            if old_file.is_file():
-                old_file.unlink()
-                log(f"删除旧文件: {old_file.relative_to(ROOT_DIR)}")
+def is_retryable_http_error(error: urllib.error.HTTPError) -> bool:
+    return error.code in {408, 429, 500, 502, 503, 504}
 
 
-def download(url: str, dst: Path) -> None:
-    log(f"下载: {url}")
-
+def fetch_bytes(url: str, timeout: int = DOWNLOAD_TIMEOUT) -> bytes:
     request = urllib.request.Request(
         url,
         headers={
@@ -196,11 +200,44 @@ def download(url: str, dst: Path) -> None:
         },
     )
 
-    with urllib.request.urlopen(request, timeout=90) as response:
-        data = response.read()
+    last_error: BaseException | None = None
+
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            last_error = error
+
+            if not is_retryable_http_error(error) or attempt == DOWNLOAD_RETRIES:
+                break
+
+            delay = RETRY_BASE_DELAY * attempt
+            log(f"下载返回 HTTP {error.code}，{delay}s 后重试: {url}")
+            time.sleep(delay)
+        except (TimeoutError, urllib.error.URLError, OSError) as error:
+            last_error = error
+
+            if attempt == DOWNLOAD_RETRIES:
+                break
+
+            delay = RETRY_BASE_DELAY * attempt
+            log(f"下载失败，{delay}s 后重试: {url} ({error})")
+            time.sleep(delay)
+
+    raise RuntimeError(f"下载失败: {url} ({last_error})")
+
+
+def download(url: str, dst: Path) -> None:
+    log(f"下载: {url}")
+
+    data = fetch_bytes(url)
 
     if url.lower().endswith((".gz", ".gzip")):
-        data = gzip.decompress(data)
+        try:
+            data = gzip.decompress(data)
+        except OSError as error:
+            raise RuntimeError(f"gzip 解压失败: {url} ({error})") from error
 
     dst.write_bytes(data)
 
@@ -550,6 +587,21 @@ def write_text_rules(path: Path, rules: list[str]) -> None:
     path.write_text("\n".join(rules) + "\n", encoding="utf-8")
 
 
+def log_skipped_samples(filename: str, skipped: list[str]) -> None:
+    if not skipped:
+        return
+
+    log(f"{filename}: 已跳过 {len(skipped)} 条无法转换为 domain/ipcidr mrs 的规则")
+
+    for index, item in enumerate(skipped[:SKIPPED_SAMPLE_LIMIT], start=1):
+        log(f"{filename}: skipped[{index}] {item}")
+
+    remaining = len(skipped) - SKIPPED_SAMPLE_LIMIT
+
+    if remaining > 0:
+        log(f"{filename}: 还有 {remaining} 条 skipped 未展示")
+
+
 def run_convert(behavior: str, txt_file: Path, mrs_file: Path) -> None:
     tmp_file = mrs_file.with_suffix(".mrs.tmp")
 
@@ -571,10 +623,10 @@ def run_convert(behavior: str, txt_file: Path, mrs_file: Path) -> None:
 
     tmp_file.replace(mrs_file)
 
-    log(f"生成: {mrs_file.relative_to(ROOT_DIR)}")
+    log(f"生成: {display_path(mrs_file)}")
 
 
-def build_one(url: str, tmpdir: Path, used_outputs: set[Path]) -> None:
+def build_one(url: str, tmpdir: Path, output_dir: Path, used_outputs: set[Path]) -> None:
     filename = filename_from_url(url)
     stem = stem_from_url(url)
     source_file = tmpdir / filename
@@ -587,8 +639,7 @@ def build_one(url: str, tmpdir: Path, used_outputs: set[Path]) -> None:
         f"{filename}: domain={len(domains)}, ipcidr={len(ipcidrs)}, skipped={len(skipped)}"
     )
 
-    if skipped:
-        log(f"{filename}: 已跳过 {len(skipped)} 条无法转换为 domain/ipcidr mrs 的规则")
+    log_skipped_samples(filename, skipped)
 
     outputs: list[tuple[str, list[str], str]] = []
 
@@ -603,16 +654,36 @@ def build_one(url: str, tmpdir: Path, used_outputs: set[Path]) -> None:
         die(f"{filename} 没有解析到可转换的 domain/ipcidr 规则")
 
     for behavior, rules, out_stem in outputs:
-        txt_file = unique_path(OUT_DIR / f"{out_stem}.txt", used_outputs)
+        txt_file = unique_path(output_dir / f"{out_stem}.txt", used_outputs)
         mrs_file = txt_file.with_suffix(".mrs")
 
         used_outputs.add(mrs_file)
 
         write_text_rules(txt_file, rules)
 
-        log(f"生成: {txt_file.relative_to(ROOT_DIR)}，共 {len(rules)} 条，behavior={behavior}")
+        log(f"生成: {display_path(txt_file)}，共 {len(rules)} 条，behavior={behavior}")
 
         run_convert(behavior, txt_file, mrs_file)
+
+
+def publish_output(staging_dir: Path) -> None:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    generated_files = sorted(path for path in staging_dir.iterdir() if path.is_file())
+
+    if not generated_files:
+        die("staging 输出目录为空，拒绝发布")
+
+    for pattern in GENERATED_PATTERNS:
+        for old_file in OUT_DIR.glob(pattern):
+            if old_file.is_file():
+                old_file.unlink()
+                log(f"删除旧文件: {display_path(old_file)}")
+
+    for generated in generated_files:
+        target = OUT_DIR / generated.name
+        shutil.copy2(generated, target)
+        log(f"发布: {display_path(target)}")
 
 
 def main() -> None:
@@ -624,16 +695,18 @@ def main() -> None:
     if not os.access(mihomo_path, os.X_OK):
         die(f"mihomo 没有执行权限: {MIHOMO_BIN}")
 
-    clean_output_dir()
-
     links = read_links()
     used_outputs: set[Path] = set()
 
     with tempfile.TemporaryDirectory() as td:
         tmpdir = Path(td)
+        staging_dir = tmpdir / "rule-mihomo"
+        staging_dir.mkdir(parents=True, exist_ok=True)
 
         for url in links:
-            build_one(url, tmpdir, used_outputs)
+            build_one(url, tmpdir, staging_dir, used_outputs)
+
+        publish_output(staging_dir)
 
     log("全部完成")
 
