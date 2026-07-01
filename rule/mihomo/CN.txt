@@ -92,6 +92,7 @@ upos-hz-mirrorakam.akamaized.net
 .ele.me
 .goofish.com
 .jd.com
+.jd.hk
 .jingxi.com
 .meituan.com
 .meituan.net
