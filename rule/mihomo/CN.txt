@@ -271,6 +271,7 @@ upos-hz-mirrorakam.akamaized.net
 .wps.cn
 .wps.com
 .yeah.net
+.aisee.tv
 .17173.com
 .acfun.cn
 .acfun.com
