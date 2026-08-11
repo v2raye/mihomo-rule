@@ -272,6 +272,16 @@ upos-hz-mirrorakam.akamaized.net
 .wps.com
 .yeah.net
 .aisee.tv
+.cibntv.net
+.cibntv.cn
+.cibn.cc
+.gitv.cn
+.bestv.com.cn
+.bestv.cn
+.wasu.cn
+.wasu.com
+.mgtv.com
+.icntv.tv
 .17173.com
 .acfun.cn
 .acfun.com
@@ -324,7 +334,6 @@ upos-hz-mirrorakam.akamaized.net
 .kuwo.com
 .letv.com
 .maoyan.com
-.mgtv.com
 .migu.cn
 .miguvideo.com
 .mooc.cn
