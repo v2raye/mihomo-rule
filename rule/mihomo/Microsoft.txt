@@ -85,9 +85,13 @@
 .events.data.microsoft.com
 .sfx.ms
 .github.com
-.github.io
 .githubassets.com
 .githubusercontent.com
+.github.io
+.github.dev
 .ghcr.io
+.githubcopilot.com
+.ghe.com
 github-cloud.s3.amazonaws.com
-default.exp-tas.com
+dependabot-actions.githubapp.com
+copilot-reports-*.b01.azurefd.net
