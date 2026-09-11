@@ -3,6 +3,7 @@
 .oaistatic.com
 .oaiusercontent.com
 .oaistatsig.com
+chatgpt.com
 cdn.openaimerge.com
 cdn.workos.com
 forwarder.workos.com
