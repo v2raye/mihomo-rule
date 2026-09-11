@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# 后缀专项修复版（基于用户上传脚本，不是全类型无损转换器）。
+# 已修复：DOMAIN/HOST-SUFFIX、geosite domain:、ABP 基础域名锚定的 +. 映射；
+#         +.google / .google 等单标签后缀的合法性过滤。
+# 未改动：旧 KEYWORD/WILDCARD 近似处理、ABP 选项/例外处理、复杂规则跳过、
+#         下载/命名/发布流程。含上述规则的源须另外审阅，不应声称全量无损。
+# 使用方法：以本文件内容替换仓库原脚本，保留原脚本路径与工作流调用方式。
+
 import gzip
 import hashlib
 import ipaddress
@@ -28,7 +35,7 @@ SKIPPED_SAMPLE_LIMIT = 10
 GENERATED_PATTERNS = ("*.mrs", "*.txt", "*.tmp", "manifest.json")
 
 
-# 可以安全转换进 mihomo behavior=domain 的 classical 规则
+# 可识别的 classical 域名类型；KEYWORD/WILDCARD 的旧逻辑不是无损转换
 DOMAIN_RULE_TYPES = {
     "DOMAIN",
     "DOMAIN-SUFFIX",
@@ -330,13 +337,13 @@ def is_domain_provider_item(value: str) -> bool:
     if is_ip_address(value):
         return False
 
-    # 兼容部分 Clash 规则源里的 +.example.com
+    # 根域及任意层级子域；允许 +.google / +.lan 等单标签后缀
     if value.startswith("+."):
-        return bool(re.search(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$", value[2:]))
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", value[2:]))
 
-    # 后缀写法：.example.com
+    # 原生 domain 集合的 .example.com 仅匹配子域，不自动改成 +.
     if value.startswith("."):
-        return bool(re.search(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+$", value[1:]))
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", value[1:]))
 
     # wildcard / keyword 近似写法
     if "*" in value:
@@ -360,7 +367,7 @@ def convert_classical_domain(rule_type: str, value: str) -> str | None:
 
     elif rule_type in {"DOMAIN-SUFFIX", "HOST-SUFFIX"}:
         value = value.lstrip(".")
-        item = f".{value}"
+        item = f"+.{value}"
 
     elif rule_type in {"DOMAIN-KEYWORD", "HOST-KEYWORD"}:
         # 近似转换：DOMAIN-KEYWORD,google -> *google*
@@ -395,7 +402,7 @@ def convert_geosite_like_line(line: str) -> str | None:
         item = line.split(":", 1)[1].strip()
 
     elif lower.startswith("domain:"):
-        item = "." + line.split(":", 1)[1].strip().lstrip(".")
+        item = "+." + line.split(":", 1)[1].strip().lstrip(".")
 
     elif lower.startswith("keyword:"):
         keyword = line.split(":", 1)[1].strip()
@@ -420,7 +427,7 @@ def convert_geosite_like_line(line: str) -> str | None:
 def convert_adblock_like_line(line: str) -> str | None:
     """
     简单兼容 AdGuard / ABP 域名锚定规则：
-    ||example.com^ -> .example.com
+    ||example.com^ -> +.example.com
 
     只转换最常见、可安全映射的域名锚定形式；
     复杂 cosmetic / regex / allowlist 规则全部跳过。
@@ -444,7 +451,7 @@ def convert_adblock_like_line(line: str) -> str | None:
     if body.startswith("*") or "/" in body or ":" in body:
         return None
 
-    item = "." + body.lstrip(".")
+    item = "+." + body.lstrip(".")
 
     if is_domain_provider_item(item):
         return item
